@@ -2,8 +2,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <algorithm>
+#include <fstream>
 
+#include <jsoncpp/json/json.h>
+#include <jsoncpp/json/writer.h>
 #include "sniffer.h"
 
 //http://www.tcpdump.org/pcap.html
@@ -37,7 +39,10 @@ void packet_handler_callback( u_char *args, const struct pcap_pkthdr* met_header
 		exit(EXIT_FAILURE); 
 	}
 	
-	cout<<endl<<"Received packet with ID "<<packet_counter++<<" whose length is "<<met_header->len<<endl;
+	//start writing data into json object
+	Json::Value json_packet_data;
+	json_packet_data["ID"] = packet_counter;
+	json_packet_data["Packet's length"] = met_header->len;
 	
 	/*
 	 * Get Ethernet data
@@ -46,90 +51,147 @@ void packet_handler_callback( u_char *args, const struct pcap_pkthdr* met_header
 	//typecast packet u_char pointer to ethernet struct
     eth_header = (struct ethernet_header *) packet;
     
-    cout<<"Ethernet type:";
     //ntohs: convert network byte order to host byte order
     switch(ntohs(eth_header->eth_type))
     {
+		//macros define din netinet/ether.h
 		case ETHERTYPE_IP: 
-			cout<<" IP"<<endl; 
+			json_packet_data["Ethernet"]["Type"] = "IP"; 
 			break;
-		case ETHERTYPE_ARP:
-			cout<<" ARP"<<endl; 
+		case ETHERTYPE_ARP: 
+			json_packet_data["Ethernet"]["Type"] = "ARP";
 			break;
 		case ETHERTYPE_REVARP:
-			cout<<" REVARP"<<endl; 
+			json_packet_data["Ethernet"]["Type"] = "REVARP"; 
 			break;
 		default:
-			cout<<" not IP/ARP/REVARP"<<endl;
+			json_packet_data["Ethernet"]["Type"] = "not IP/ARP/REVARP";
 	}
 	
+	
+	//ether_ntoa returns a const char* (statical) which si overwritten by next ether_ntoa calls => copy the returned array into another memory address
 	const char *aux = ether_ntoa(&eth_header->dest_addr);
 	const char *dest_MAC = strcpy(new char[strlen(aux)+1], aux);
-	cout<<"Dest MAC: "<<dest_MAC<<endl;
+	json_packet_data["Ethernet"]["Destination MAC address"] = dest_MAC;
+	
 	aux = ether_ntoa(&eth_header->src_addr);
 	const char *src_MAC = strcpy(new char[strlen(aux)+1], aux);
-	cout<<"Source MAC: "<<src_MAC<<endl;
+	json_packet_data["Ethernet"]["Source MAC address"] = src_MAC;
 	
 	/*
 	 * Get IP data
 	 */ 
 	const struct ip_header *ip;
-	u_int size_ip;
+	unsigned short size_ip_header;
 	
 	//Since Ethernet header size is known, the IP header can be inferred by adding an offset to packet's pointer
 	ip = (struct ip_header*)(packet + SIZE_ETHERNET);
-	//IP header has 4-byte words
-	size_ip = IP_HL(ip)*4;
-	if (size_ip < 20) 
+	//IP header has 4-byte words, so compute its size and check it
+	size_ip_header = IP_HL(ip)*4;
+	if (size_ip_header < 20) 
 	{
-		cout<<"IP header length is below 20"<<endl;
+		cout<<"IP header length is below 20: "<<size_ip_header<<endl;
 		exit(EXIT_FAILURE);
 	}
 	
-	aux = inet_ntoa(ip->ip_dest);
-	const char *dest_IP = strcpy(new char[strlen(aux)+1], aux);
-	cout<<"Dest IP: "<<dest_IP<<endl;
-	aux = inet_ntoa(ip->ip_src);
-	const char *src_IP = strcpy(new char[strlen(aux)+1], aux);
-	cout<<"Source IP: "<<src_IP<<endl;
-	
-	cout<<"IP protocol:";
 	switch(ip->ip_protocol) 
 	{
+		//macros defined in netinet/in
 		case IPPROTO_TCP:
-			cout<<" TCP"<<endl;
+			json_packet_data["IP"]["Protocol"] = "TCP";
 			break;
 		case IPPROTO_UDP:
-			cout<<" UDP"<<endl;
+			json_packet_data["IP"]["Protocol"] = "UDP";
 			break;
 		case IPPROTO_ICMP:
-			cout<<" ICMP"<<endl;
+			json_packet_data["IP"]["Protocol"] = "ICMP";
 			break;
 		case IPPROTO_IGMP:
-			cout<<" IGMP"<<endl;
+			json_packet_data["IP"]["Protocol"] = "IGMP";
 			break;
 		case IPPROTO_IP:
-			cout<<" IP"<<endl;
+			json_packet_data["IP"]["Protocol"] = "IP";
+			break;
+		case IPPROTO_IPV6:
+			json_packet_data["IP"]["Protocol"] = "IPv6";
 			break;
 		default:
-			cout<<ip->ip_protocol<<endl;
+			json_packet_data["IP"]["Protocol"] = ip->ip_protocol;
 			break;
 	}
 	
-	/*
-	const struct sniff_tcp *tcp; 
-	u_int size_tcp;
+	//inet_ntoa returns a const char* (statical) which si overwritten by next inet_ntoa calls => copy the returned array into another memory address
+	aux = inet_ntoa(ip->ip_dest);
+	const char *dest_IP = strcpy(new char[strlen(aux)+1], aux);
+	json_packet_data["IP"]["Destination IP address"] = dest_IP;
 	
-	//Once the IP header length is known, the TCP header can be inferred
-	tcp = (struct sniff_tcp*)(packet + SIZE_ETHERNET + size_ip);
-	//TCP header has 4-byte words
-	size_tcp = TH_OFF(tcp)*4;
-	if (size_tcp < 20) 
+	aux = inet_ntoa(ip->ip_src);
+	const char *src_IP = strcpy(new char[strlen(aux)+1], aux);
+	json_packet_data["IP"]["Source IP address"] = src_IP;
+	
+	struct hostent *he = gethostbyaddr( ((const char*)&ip->ip_dest), sizeof(struct in_addr), AF_INET);
+	if(he == NULL)
 	{
-		printf("   * Invalid TCP header length: %u bytes\n", size_tcp);
+		cout<<"Couldn't get hostname"<<endl;
 		exit(EXIT_FAILURE);
 	}
-	*/
+	
+	json_packet_data["IP"]["hostname"] = he->h_name;
+	
+	/*
+	 * Get TCP data
+	 */ 
+	if(ip->ip_protocol == IPPROTO_TCP)
+	{
+		const struct tcp_header *tcp; 
+		unsigned short size_tcp_header;
+		
+		//Once the IP header length is known, the TCP header can be inferred
+		tcp = (struct tcp_header*)(packet + SIZE_ETHERNET + size_ip_header);
+		//TCP header has 4-byte words, so compute its offset and check its size
+		size_tcp_header = TCP_OFF(tcp)*4;
+		if (size_tcp_header < 20) 
+		{
+			cout<<"TCP header length is below 20: "<<size_tcp_header<<endl;
+			exit(EXIT_FAILURE);
+		}
+		
+		json_packet_data["TCP"]["Destination port"] = ntohs(tcp->tcp_dest_port);
+		json_packet_data["TCP"]["Source port"] = ntohs(tcp->tcp_src_port);
+		
+		unsigned short tcp_flag = tcp->tcp_flags&TCP_FIN;
+		json_packet_data["TCP"]["Flags"]["FIN"] = tcp_flag;
+		
+		tcp_flag = tcp->tcp_flags&TCP_SYN;
+		json_packet_data["TCP"]["Flags"]["SYN"] = tcp_flag;
+		
+		tcp_flag = tcp->tcp_flags&TCP_RST;
+		json_packet_data["TCP"]["Flags"]["RST"] = tcp_flag;
+		
+		tcp_flag = tcp->tcp_flags&TCP_PUSH;
+		json_packet_data["TCP"]["Flags"]["PUSH"] = tcp_flag;
+		
+		tcp_flag = tcp->tcp_flags&TCP_ACK;
+		json_packet_data["TCP"]["Flags"]["ACK"] = tcp_flag;
+		
+		tcp_flag = tcp->tcp_flags&TCP_URG;
+		json_packet_data["TCP"]["Flags"]["URG"] = tcp_flag;
+		
+		tcp_flag = tcp->tcp_flags&TCP_ECE;
+		json_packet_data["TCP"]["Flags"]["ECE"] = tcp_flag;
+		
+		tcp_flag = tcp->tcp_flags&TCP_CWR;
+		json_packet_data["TCP"]["Flags"]["CWR"] = tcp_flag;
+	}
+	
+	//write the json objhect into JSON file
+	ofstream file_id;
+    file_id.open("packet"+to_string(packet_counter++)+".json", ios::out);
+    
+	Json::StyledWriter styledWriter;
+	file_id << styledWriter.write(json_packet_data);
+	
+	file_id.close();
 }
 
 
@@ -137,13 +199,13 @@ int main()
 {
 	//pcap functions take as argument a char buffer to store the error code in 
 	char errbuf[PCAP_ERRBUF_SIZE];
-	const int sniffed_packets_no = 4;
+	const int sniffed_packets_no = 8;
 	
 	/*
 	 * Step 1: determine on which interface is sniffed on
 	 */  
 	const char *device = "wlan0";
-	/*pcap_lookupdev(errbuf);
+	/*const char *device = pcap_lookupdev(errbuf);
 	if (device == NULL) 
 	{
 		fprintf(stderr, "Couldn't find device to sniff on: %s\n", errbuf);
